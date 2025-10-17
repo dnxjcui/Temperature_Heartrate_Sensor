@@ -16,8 +16,8 @@ float objTempC = 0.0;
 float objTempF = 0.0;
 
 // **DROP-IN 1: Variables for rolling average**
-static int buffer = 25;
-float tempBuffer[25];
+static int buffer = 100;
+float tempBuffer[100];
 int bufferIndex = 0;
 int sampleCount = 0;
 float avgTempF = 0.0;
@@ -85,16 +85,16 @@ void loop(){
     
     // Serial.print("Average Temp (F) = ");
     // Serial.println(avgTempF);
-    Serial.print(millis());
-    Serial.print(",");
-    Serial.print(objTempC);
-    Serial.print(",");
-    Serial.print(objTempF);
-    Serial.print(",");
-    Serial.println(avgTempF);
   }
+  Serial.print(millis());
+  Serial.print(",");
+  Serial.print(objTempC);
+  Serial.print(",");
+  Serial.print(objTempF);
+  Serial.print(",");
+  Serial.println(avgTempF);
 
   // Serial.println();
-  delayMicroseconds(1000);  
+  delayMicroseconds(10000);  
 }
 

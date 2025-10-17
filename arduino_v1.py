@@ -93,12 +93,12 @@ try:
     
     print("Waiting for Arduino to be ready...")
     # Wait for READY signal
-    # while True:
-        # line = ser.readline().decode('utf-8').strip()
-        # print(line)
-        # if line == "READY":
-        #     print("\nStreaming data...\n")
-        #     break
+    while True:
+        line = ser.readline().decode('utf-8').strip()
+        print(line)
+        if line == "READY":
+            print("\nStreaming data...\n")
+            break
     
     # Start animation
     ani = FuncAnimation(fig, update, init_func=init, blit=False, interval=50)

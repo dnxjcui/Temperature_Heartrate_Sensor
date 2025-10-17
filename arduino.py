@@ -6,19 +6,34 @@ import time
 from collections import deque
 import sys
 
+# ============== CONFIGURATION ==============
 # Configure serial port (change COM port to match your device)
 PORT = 'COM6'  # Windows: 'COM3', Mac/Linux: '/dev/ttyUSB0' or '/dev/cu.usbserial-*'
 BAUD_RATE = 115200
 
+# Time window settings
+WINDOW_SIZE = 5  # Show last N seconds of data (change this to 10 for 10-second window)
+
+# Y-axis limits for Celsius plot
+Y_AXIS_LOW_C = 0    # Lower limit for Celsius plot
+Y_AXIS_HIGH_C = 50  # Upper limit for Celsius plot
+
+# Y-axis limits for Fahrenheit plot  
+Y_AXIS_LOW_F = 32   # Lower limit for Fahrenheit plot
+Y_AXIS_HIGH_F = 120 # Upper limit for Fahrenheit plot
+
 # Buffer settings for performance
-MAX_POINTS = 500  # Maximum points to display
-BUFFER_SIZE = 1000  # Circular buffer size
+# Calculate buffer size based on expected data rate (adjust if needed)
+# Assuming ~100 samples/second, we keep a small buffer
+EXPECTED_SAMPLE_RATE = 100  # samples per second (adjust based on your sensor)
+BUFFER_SIZE = int(WINDOW_SIZE * EXPECTED_SAMPLE_RATE * 1.2)  # 20% extra buffer
+# ==========================================
 
 class TemperatureMonitor(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         
-        # Data storage with deques for efficiency
+        # Data storage with deques for efficiency - auto-discard old data
         self.times = deque(maxlen=BUFFER_SIZE)
         self.temps_c = deque(maxlen=BUFFER_SIZE)
         self.temps_f = deque(maxlen=BUFFER_SIZE)
@@ -34,7 +49,7 @@ class TemperatureMonitor(QtWidgets.QWidget):
         # Setup timer for reading serial data
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update_data)
-        self.timer.start(10)  # Update every 10ms
+        self.timer.start(20)  # Update every 10ms
         
     def setup_ui(self):
         # Create main layout
@@ -72,14 +87,14 @@ class TemperatureMonitor(QtWidgets.QWidget):
         layout.addWidget(self.plot_f)
         
         # Set initial plot ranges
-        self.plot_c.setXRange(0, 10)
-        self.plot_c.setYRange(0, 50)
-        self.plot_f.setXRange(0, 10)
-        self.plot_f.setYRange(32, 120)
+        self.plot_c.setXRange(0, WINDOW_SIZE)
+        self.plot_c.setYRange(Y_AXIS_LOW_C, Y_AXIS_HIGH_C)
+        self.plot_f.setXRange(0, WINDOW_SIZE)
+        self.plot_f.setYRange(Y_AXIS_LOW_F, Y_AXIS_HIGH_F)
         
-        # Enable auto-ranging with padding
-        self.plot_c.enableAutoRange('xy', True, 0.95)
-        self.plot_f.enableAutoRange('xy', True, 0.95)
+        # Disable auto-ranging to use fixed window and y-axis
+        self.plot_c.disableAutoRange()
+        self.plot_f.disableAutoRange()
         
     def setup_serial(self):
         try:
@@ -154,28 +169,38 @@ class TemperatureMonitor(QtWidgets.QWidget):
             print(f"Error reading data: {e}")
             
     def update_plots(self):
-        # Convert deques to numpy arrays for efficient plotting
-        # Only plot last MAX_POINTS for performance
-        points_to_plot = min(len(self.times), MAX_POINTS)
-        
-        if points_to_plot > 0:
-            # Use numpy arrays for better performance
-            t_array = np.array(list(self.times))[-points_to_plot:]
-            c_array = np.array(list(self.temps_c))[-points_to_plot:]
-            f_array = np.array(list(self.temps_f))[-points_to_plot:]
-            avg_f_array = np.array(list(self.avg_temps_f))[-points_to_plot:]
+        # Only keep and plot data within the window
+        if len(self.times) > 0:
+            # Get current time (latest timestamp)
+            current_time = self.times[-1]
+            cutoff_time = current_time - WINDOW_SIZE
             
-            # Update curves with downsampling if needed
-            if points_to_plot > 1000:
-                # Downsample for performance if too many points
-                ds = points_to_plot // 500
-                self.curve_c.setData(t_array[::ds], c_array[::ds])
-                self.curve_f.setData(t_array[::ds], f_array[::ds])
-                self.curve_avg_f.setData(t_array[::ds], avg_f_array[::ds])
-            else:
+            # Remove old data that's outside the window
+            while len(self.times) > 0 and self.times[0] < cutoff_time:
+                self.times.popleft()
+                self.temps_c.popleft()
+                self.temps_f.popleft()
+                self.avg_temps_f.popleft()
+            
+            # Convert remaining data to arrays for plotting
+            if len(self.times) > 0:
+                t_array = np.array(self.times)
+                c_array = np.array(self.temps_c)
+                f_array = np.array(self.temps_f)
+                avg_f_array = np.array(self.avg_temps_f)
+                
+                # Update curves
                 self.curve_c.setData(t_array, c_array)
                 self.curve_f.setData(t_array, f_array)
                 self.curve_avg_f.setData(t_array, avg_f_array)
+                
+                # Update X-axis range to show rolling window
+                self.plot_c.setXRange(max(0, current_time - WINDOW_SIZE), current_time)
+                self.plot_f.setXRange(max(0, current_time - WINDOW_SIZE), current_time)
+                
+                # Keep Y-axis fixed to configured values
+                self.plot_c.setYRange(Y_AXIS_LOW_C, Y_AXIS_HIGH_C)
+                self.plot_f.setYRange(Y_AXIS_LOW_F, Y_AXIS_HIGH_F)
             
     def closeEvent(self, event):
         # Clean up serial connection on close
