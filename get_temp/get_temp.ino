@@ -95,6 +95,7 @@ void loop(){
   Serial.println(avgTempF);
 
   // Serial.println();
-  delayMicroseconds(10000);  
+  // delayMicroseconds(10000);
+  delay(1);  
 }
 

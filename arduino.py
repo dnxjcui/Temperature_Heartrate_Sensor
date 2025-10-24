@@ -25,8 +25,8 @@ Y_AXIS_HIGH_F = 120 # Upper limit for Fahrenheit plot
 # Buffer settings for performance
 # Calculate buffer size based on expected data rate (adjust if needed)
 # Assuming ~100 samples/second, we keep a small buffer
-EXPECTED_SAMPLE_RATE = 100  # samples per second (adjust based on your sensor)
-BUFFER_SIZE = int(WINDOW_SIZE * EXPECTED_SAMPLE_RATE * 1.2)  # 20% extra buffer
+EXPECTED_SAMPLE_RATE = 1000  # samples per second (adjust based on your sensor)
+BUFFER_SIZE = int(WINDOW_SIZE * EXPECTED_SAMPLE_RATE * 1.1)  # 10% extra buffer
 # ==========================================
 
 class TemperatureMonitor(QtWidgets.QWidget):
@@ -73,6 +73,13 @@ class TemperatureMonitor(QtWidgets.QWidget):
         self.plot_c.showGrid(x=True, y=True, alpha=0.3)
         self.curve_c = self.plot_c.plot(pen=pg.mkPen('b', width=2), name='Temp (°C)')
         layout.addWidget(self.plot_c)
+
+        self.plot_stft = pg.PlotWidget(title="STFT (last 5 seconds)")
+        self.plot_stft.setLabel('bottom', 'Frequency', units='Hz')
+        self.plot_stft.setLabel('left', 'Amplitude', units='dB')
+        self.plot_stft.showGrid(x=True, y=True, alpha=0.3)
+        self.curve_stft = self.plot_stft.plot(pen=pg.mkPen('r', width=2), name='STFT')
+        layout.addWidget(self.plot_stft)
         
         # Create plot widget for Fahrenheit
         self.plot_f = pg.PlotWidget(title="Object Temperature (Fahrenheit)")
@@ -198,9 +205,22 @@ class TemperatureMonitor(QtWidgets.QWidget):
                 self.plot_c.setXRange(max(0, current_time - WINDOW_SIZE), current_time)
                 self.plot_f.setXRange(max(0, current_time - WINDOW_SIZE), current_time)
                 
-                # Keep Y-axis fixed to configured values
+                # Keep Celsius Y-axis fixed to configured values
                 self.plot_c.setYRange(Y_AXIS_LOW_C, Y_AXIS_HIGH_C)
-                self.plot_f.setYRange(Y_AXIS_LOW_F, Y_AXIS_HIGH_F)
+
+                # Auto-scale Fahrenheit Y-axis with a minimum ±5°F window
+                f_min = float(min(np.min(f_array), np.min(avg_f_array)))
+                f_max = float(max(np.max(f_array), np.max(avg_f_array)))
+                if np.isfinite(f_min) and np.isfinite(f_max):
+                    span = f_max - f_min
+                    if span < 3.0:
+                        mid = (f_max + f_min) / 2.0
+                        low = mid - 1.5
+                        high = mid + 1.5
+                    else:
+                        low = f_min
+                        high = f_max
+                    self.plot_f.setYRange(low, high)
             
     def closeEvent(self, event):
         # Clean up serial connection on close
