@@ -6,10 +6,14 @@ import time
 from collections import deque
 import sys
 
+# Use Qt components from pyqtgraph.Qt for compatibility
+from pyqtgraph.Qt.QtCore import Signal as pyqtSignal, Slot as pyqtSlot, QObject
+
 # ============== CONFIGURATION ==============
 # Configure serial port (change COM port to match your device)
 PORT = 'COM6'  # Windows: 'COM3', Mac/Linux: '/dev/ttyUSB0' or '/dev/cu.usbserial-*'
 BAUD_RATE = 115200
+BAUD_RATE = 500000
 
 # Time window settings
 WINDOW_SIZE = 5  # Show last N seconds of data (change this to 10 for 10-second window)
@@ -25,9 +29,115 @@ Y_AXIS_HIGH_F = 120 # Upper limit for Fahrenheit plot
 # Buffer settings for performance
 # Calculate buffer size based on expected data rate (adjust if needed)
 # Assuming ~100 samples/second, we keep a small buffer
-EXPECTED_SAMPLE_RATE = 1000  # samples per second (adjust based on your sensor)
+EXPECTED_SAMPLE_RATE = 10000  # samples per second (adjust based on your sensor)
 BUFFER_SIZE = int(WINDOW_SIZE * EXPECTED_SAMPLE_RATE * 1.1)  # 10% extra buffer
 # ==========================================
+
+class SerialWorker(QObject):
+    """
+    Worker thread for reading serial data without blocking the UI
+    """
+    data_received = pyqtSignal(float, float, float, float)  # timestamp, temp_c, temp_f, avg_temp_f
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, port, baud_rate):
+        super().__init__()
+        self.port = port
+        self.baud_rate = baud_rate
+        self.ser = None
+        self.running = False
+        self.line_buffer = ""  # Buffer for incomplete lines
+        
+    @pyqtSlot()
+    def start_reading(self):
+        """Start the serial reading - called when thread starts"""
+        try:
+            self.ser = serial.Serial(self.port, self.baud_rate, timeout=0.001)
+            time.sleep(2)  # Wait for Arduino to reset
+            self.ser.flushInput()
+            self.running = True
+            print(f"Worker: Connected to {self.port} at {self.baud_rate} baud")
+            
+            # Create timer in the worker thread
+            self.timer = QtCore.QTimer()
+            self.timer.timeout.connect(self.read_data)
+            self.timer.start(10)  # Read every 10ms
+            
+        except serial.SerialException as e:
+            self.error_occurred.emit(f"Error opening serial port: {e}")
+            return
+            
+    @pyqtSlot()
+    def stop_reading(self):
+        """Stop the serial reading thread"""
+        self.running = False
+        if hasattr(self, 'timer'):
+            self.timer.stop()
+        if self.ser and self.ser.is_open:
+            self.ser.close()
+            print("Worker: Serial port closed")
+            
+    @pyqtSlot()
+    def read_data(self):
+        """Read data from serial port - called by timer in worker thread"""
+        if not self.running or not self.ser or not self.ser.is_open:
+            return
+            
+        try:
+            bytes_to_read = self.ser.in_waiting
+            if bytes_to_read > 0:
+                # Read new data and add to buffer
+                new_data = self.ser.read(bytes_to_read).decode('utf-8', errors='ignore')
+                self.line_buffer += new_data
+                
+                # Process complete lines (split on newline)
+                while '\n' in self.line_buffer:
+                    line, self.line_buffer = self.line_buffer.split('\n', 1)
+                    line = line.strip()
+                    
+                    # Skip empty lines and header lines
+                    if not line or line.startswith('Board') or line.startswith('Time'):
+                        continue
+                        
+                    if ',' in line:
+                        parts = line.split(',')
+                        if len(parts) == 4:
+                            try:
+                                timestamp = float(parts[0]) / 1000.0
+                                temp_c = float(parts[1])
+                                temp_f = float(parts[2])
+                                avg_temp_f = float(parts[3])
+                                
+                                # Validate data ranges - reject obviously bad data
+                                # Reasonable temperature range: -20°C to 100°C
+                                if not (-20 <= temp_c <= 100):
+                                    print(f"Rejected bad temp_c: {temp_c}")
+                                    continue
+                                if not (-4 <= temp_f <= 212):
+                                    print(f"Rejected bad temp_f: {temp_f}")
+                                    continue
+                                if not (-4 <= avg_temp_f <= 212):
+                                    print(f"Rejected bad avg_temp_f: {avg_temp_f}")
+                                    continue
+                                    
+                                # Check for NaN or Inf
+                                if not (np.isfinite(temp_c) and np.isfinite(temp_f) and np.isfinite(avg_temp_f)):
+                                    print(f"Rejected non-finite values")
+                                    continue
+                                
+                                # Emit data to main thread
+                                self.data_received.emit(timestamp, temp_c, temp_f, avg_temp_f)
+                                
+                            except (ValueError, IndexError) as e:
+                                print(f"Parse error on line '{line}': {e}")
+                                continue
+                
+                # Prevent buffer from growing too large (keep last 1000 chars max)
+                if len(self.line_buffer) > 1000:
+                    self.line_buffer = self.line_buffer[-1000:]
+                                
+        except Exception as e:
+            self.error_occurred.emit(f"Error reading data: {e}")
 
 class TemperatureMonitor(QtWidgets.QWidget):
     def __init__(self):
@@ -43,13 +153,13 @@ class TemperatureMonitor(QtWidgets.QWidget):
         # Setup UI
         self.setup_ui()
         
-        # Setup serial connection
-        self.setup_serial()
+        # Setup worker thread for serial communication
+        self.setup_worker_thread()
         
-        # Setup timer for reading serial data
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update_data)
-        self.timer.start(20)  # Update every 10ms
+        # Setup timer for plot updates (main thread only)
+        self.plot_timer = QtCore.QTimer()
+        self.plot_timer.timeout.connect(self.update_plots)
+        self.plot_timer.start(50)  # Update plots every 50ms
         
     def setup_ui(self):
         # Create main layout
@@ -73,13 +183,6 @@ class TemperatureMonitor(QtWidgets.QWidget):
         self.plot_c.showGrid(x=True, y=True, alpha=0.3)
         self.curve_c = self.plot_c.plot(pen=pg.mkPen('b', width=2), name='Temp (°C)')
         layout.addWidget(self.plot_c)
-
-        self.plot_stft = pg.PlotWidget(title="STFT (last 5 seconds)")
-        self.plot_stft.setLabel('bottom', 'Frequency', units='Hz')
-        self.plot_stft.setLabel('left', 'Amplitude', units='dB')
-        self.plot_stft.showGrid(x=True, y=True, alpha=0.3)
-        self.curve_stft = self.plot_stft.plot(pen=pg.mkPen('r', width=2), name='STFT')
-        layout.addWidget(self.plot_stft)
         
         # Create plot widget for Fahrenheit
         self.plot_f = pg.PlotWidget(title="Object Temperature (Fahrenheit)")
@@ -103,130 +206,138 @@ class TemperatureMonitor(QtWidgets.QWidget):
         self.plot_c.disableAutoRange()
         self.plot_f.disableAutoRange()
         
-    def setup_serial(self):
-        try:
-            self.ser = serial.Serial(PORT, BAUD_RATE, timeout=0.001)  # Very short timeout for non-blocking
-            time.sleep(2)  # Wait for Arduino to reset
-            self.ser.flushInput()  # Clear any buffered data
-            print(f"Connected to {PORT} at {BAUD_RATE} baud")
-            self.status_label.setText(f'Connected to {PORT} - Streaming data...')
-        except serial.SerialException as e:
-            print(f"Error opening serial port: {e}")
-            self.status_label.setText(f'Error: {e}')
-            self.list_available_ports()
-            self.ser = None
-            
-    def list_available_ports(self):
-        print("Available ports:")
-        import serial.tools.list_ports
-        ports = serial.tools.list_ports.comports()
-        for port in ports:
-            print(f"  {port.device}")
-            
-    def update_data(self):
-        if not hasattr(self, 'ser') or self.ser is None or not self.ser.is_open:
+    def setup_worker_thread(self):
+        """Setup worker thread for serial communication"""
+        # Create worker and thread
+        self.worker = SerialWorker(PORT, BAUD_RATE)
+        self.worker_thread = QtCore.QThread()
+        
+        # Move worker to thread
+        self.worker.moveToThread(self.worker_thread)
+        
+        # Connect signals - these will be called in the main thread
+        self.worker.data_received.connect(self.on_data_received)
+        self.worker.error_occurred.connect(self.on_error_occurred)
+        
+        # Connect thread lifecycle signals
+        self.worker_thread.started.connect(self.worker.start_reading)
+        self.worker_thread.finished.connect(self.worker.stop_reading)
+        
+        # Start the thread
+        self.worker_thread.start()
+        
+    @pyqtSlot(float, float, float, float)
+    def on_data_received(self, timestamp, temp_c, temp_f, avg_temp_f):
+        """Handle data received from worker thread (runs in main thread)"""
+        # Initialize start time
+        if self.start_time is None:
+            self.start_time = timestamp
+            self.last_print_time = time.time()
+            self.data_count = 0
+            self.last_timestamp = -1
+        
+        # Store data with relative time
+        relative_time = timestamp - self.start_time
+        
+        # Skip duplicate or out-of-order data
+        if len(self.times) > 0 and relative_time <= self.times[-1]:
             return
             
-        try:
-            # Read all available data
-            bytes_to_read = self.ser.in_waiting
-            if bytes_to_read > 0:
-                # Read multiple lines if available
-                data = self.ser.read(bytes_to_read).decode('utf-8', errors='ignore')
-                lines = data.strip().split('\n')
-                
-                for line in lines:
-                    # Skip setup messages, only process CSV data
-                    if ',' in line and not line.startswith('Board'):
-                        parts = line.strip().split(',')
-                        if len(parts) == 4:
-                            try:
-                                timestamp = float(parts[0]) / 1000.0  # Convert ms to seconds
-                                temp_c = float(parts[1])
-                                temp_f = float(parts[2])
-                                avg_temp_f = float(parts[3])
-                                
-                                # Initialize start time
-                                if self.start_time is None:
-                                    self.start_time = timestamp
-                                
-                                # Store data with relative time
-                                relative_time = timestamp - self.start_time
-                                self.times.append(relative_time)
-                                self.temps_c.append(temp_c)
-                                self.temps_f.append(temp_f)
-                                self.avg_temps_f.append(avg_temp_f)
-                                
-                                # Update status
-                                self.status_label.setText(
-                                    f'Time: {relative_time:.2f}s | '
-                                    f'C: {temp_c:.2f}°C | '
-                                    f'F: {temp_f:.2f}°F | '
-                                    f'Avg: {avg_temp_f:.2f}°F'
-                                )
-                                
-                            except ValueError:
-                                continue
-                
-                # Update plots if we have data
-                if len(self.times) > 0:
-                    self.update_plots()
-                    
-        except Exception as e:
-            print(f"Error reading data: {e}")
-            
+        self.times.append(relative_time)
+        self.temps_c.append(temp_c)
+        self.temps_f.append(temp_f)
+        self.avg_temps_f.append(avg_temp_f)
+        
+        self.data_count += 1
+        
+        # Print data rate every 2 seconds for debugging
+        current_print_time = time.time()
+        if current_print_time - self.last_print_time >= 2.0:
+            rate = self.data_count / (current_print_time - self.last_print_time)
+            print(f"Data rate: {rate:.1f} samples/sec, Buffer size: {len(self.times)}")
+            self.last_print_time = current_print_time
+            self.data_count = 0
+        
+        # Update status
+        self.status_label.setText(
+            f'Time: {relative_time:.2f}s | '
+            f'C: {temp_c:.2f}°C | '
+            f'F: {temp_f:.2f}°F | '
+            f'Avg: {avg_temp_f:.2f}°F'
+        )
+        
+    @pyqtSlot(str)
+    def on_error_occurred(self, error_msg):
+        """Handle errors from worker thread (runs in main thread)"""
+        print(f"Worker error: {error_msg}")
+        self.status_label.setText(f'Error: {error_msg}')
+        
     def update_plots(self):
-        # Only keep and plot data within the window
-        if len(self.times) > 0:
-            # Get current time (latest timestamp)
-            current_time = self.times[-1]
-            cutoff_time = current_time - WINDOW_SIZE
+        """Update plots - runs in main thread only"""
+        if len(self.times) < 2:  # Need at least 2 points to draw a line
+            return
             
-            # Remove old data that's outside the window
-            while len(self.times) > 0 and self.times[0] < cutoff_time:
-                self.times.popleft()
-                self.temps_c.popleft()
-                self.temps_f.popleft()
-                self.avg_temps_f.popleft()
-            
-            # Convert remaining data to arrays for plotting
-            if len(self.times) > 0:
-                t_array = np.array(self.times)
-                c_array = np.array(self.temps_c)
-                f_array = np.array(self.temps_f)
-                avg_f_array = np.array(self.avg_temps_f)
-                
-                # Update curves
-                self.curve_c.setData(t_array, c_array)
-                self.curve_f.setData(t_array, f_array)
-                self.curve_avg_f.setData(t_array, avg_f_array)
-                
-                # Update X-axis range to show rolling window
-                self.plot_c.setXRange(max(0, current_time - WINDOW_SIZE), current_time)
-                self.plot_f.setXRange(max(0, current_time - WINDOW_SIZE), current_time)
-                
-                # Keep Celsius Y-axis fixed to configured values
-                self.plot_c.setYRange(Y_AXIS_LOW_C, Y_AXIS_HIGH_C)
+        # Get current time (latest timestamp)
+        current_time = self.times[-1]
+        cutoff_time = current_time - WINDOW_SIZE
+        
+        # Remove old data that's outside the window
+        while len(self.times) > 1 and self.times[0] < cutoff_time:
+            self.times.popleft()
+            self.temps_c.popleft()
+            self.temps_f.popleft()
+            self.avg_temps_f.popleft()
+        
+        # Convert to numpy arrays for plotting
+        t_array = np.array(self.times, dtype=np.float64)
+        c_array = np.array(self.temps_c, dtype=np.float64)
+        f_array = np.array(self.temps_f, dtype=np.float64)
+        avg_f_array = np.array(self.avg_temps_f, dtype=np.float64)
+        
+        # Update curves - this draws ONE continuous line through all points
+        self.curve_c.setData(t_array, c_array)
+        self.curve_f.setData(t_array, f_array)
+        self.curve_avg_f.setData(t_array, avg_f_array)
+        
+        # Update X-axis range to show rolling window
+        x_min = max(0, current_time - WINDOW_SIZE)
+        x_max = current_time + 0.5  # Add small buffer on right
+        self.plot_c.setXRange(x_min, x_max, padding=0)
+        self.plot_f.setXRange(x_min, x_max, padding=0)
+        
+        # Keep Celsius Y-axis fixed to configured values
+        self.plot_c.setYRange(Y_AXIS_LOW_C, Y_AXIS_HIGH_C, padding=0)
 
-                # Auto-scale Fahrenheit Y-axis with a minimum ±5°F window
-                f_min = float(min(np.min(f_array), np.min(avg_f_array)))
-                f_max = float(max(np.max(f_array), np.max(avg_f_array)))
-                if np.isfinite(f_min) and np.isfinite(f_max):
-                    span = f_max - f_min
-                    if span < 3.0:
-                        mid = (f_max + f_min) / 2.0
-                        low = mid - 1.5
-                        high = mid + 1.5
-                    else:
-                        low = f_min
-                        high = f_max
-                    self.plot_f.setYRange(low, high)
+        # Auto-scale Fahrenheit Y-axis with padding
+        if len(f_array) > 0 and len(avg_f_array) > 0:
+            f_min = min(np.min(f_array), np.min(avg_f_array))
+            f_max = max(np.max(f_array), np.max(avg_f_array))
+            
+            if np.isfinite(f_min) and np.isfinite(f_max):
+                span = f_max - f_min
+                if span < 3.0:
+                    # If range is too small, use fixed window around midpoint
+                    mid = (f_max + f_min) / 2.0
+                    self.plot_f.setYRange(mid - 1.5, mid + 1.5, padding=0)
+                else:
+                    # Add 10% padding to the range
+                    padding = span * 0.1
+                    self.plot_f.setYRange(f_min - padding, f_max + padding, padding=0)
             
     def closeEvent(self, event):
-        # Clean up serial connection on close
-        if hasattr(self, 'ser') and self.ser and self.ser.is_open:
-            self.ser.close()
-            print("Serial port closed")
+        """Clean up worker thread on close"""
+        print("Closing application...")
+        
+        # Stop the worker
+        if hasattr(self, 'worker'):
+            self.worker.stop_reading()
+            
+        # Stop and wait for thread to finish
+        if hasattr(self, 'worker_thread'):
+            self.worker_thread.quit()
+            self.worker_thread.wait(3000)  # Wait up to 3 seconds
+            print("Worker thread stopped")
+            
         event.accept()
 
 def main():

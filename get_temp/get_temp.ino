@@ -23,7 +23,8 @@ int sampleCount = 0;
 float avgTempF = 0.0;
 
 void setup(){
-  Serial.begin(115200);
+  // Serial.begin(115200);
+  Serial.begin(500000);
   Serial.println("Board initialized!");
   
   while (!Serial);
@@ -95,7 +96,7 @@ void loop(){
   Serial.println(avgTempF);
 
   // Serial.println();
-  // delayMicroseconds(10000);
-  delay(1);  
+  delayMicroseconds(10);
+  // delay(1);  
 }
 
