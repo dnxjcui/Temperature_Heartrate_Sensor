@@ -8,15 +8,16 @@ import sys
 
 # Use Qt components from pyqtgraph.Qt for compatibility
 from pyqtgraph.Qt.QtCore import Signal as pyqtSignal, Slot as pyqtSlot, QObject
+from utils import SerialWorker, compute_heart_rate_stft
 
 # ============== CONFIGURATION ==============
 # Configure serial port (change COM port to match your device)
 PORT = 'COM6'  # Windows: 'COM3', Mac/Linux: '/dev/ttyUSB0' or '/dev/cu.usbserial-*'
-BAUD_RATE = 115200
+# BAUD_RATE = 115200
 BAUD_RATE = 500000
 
 # Time window settings
-WINDOW_SIZE = 5  # Show last N seconds of data (change this to 10 for 10-second window)
+WINDOW_SIZE = 15  # Show last N seconds of data (change this to 10 for 10-second window)
 
 # Y-axis limits for Celsius plot
 Y_AXIS_LOW_C = 0    # Lower limit for Celsius plot
@@ -33,112 +34,6 @@ EXPECTED_SAMPLE_RATE = 10000  # samples per second (adjust based on your sensor)
 BUFFER_SIZE = int(WINDOW_SIZE * EXPECTED_SAMPLE_RATE * 1.1)  # 10% extra buffer
 # ==========================================
 
-class SerialWorker(QObject):
-    """
-    Worker thread for reading serial data without blocking the UI
-    """
-    data_received = pyqtSignal(float, float, float, float)  # timestamp, temp_c, temp_f, avg_temp_f
-    error_occurred = pyqtSignal(str)
-    
-    def __init__(self, port, baud_rate):
-        super().__init__()
-        self.port = port
-        self.baud_rate = baud_rate
-        self.ser = None
-        self.running = False
-        self.line_buffer = ""  # Buffer for incomplete lines
-        
-    @pyqtSlot()
-    def start_reading(self):
-        """Start the serial reading - called when thread starts"""
-        try:
-            self.ser = serial.Serial(self.port, self.baud_rate, timeout=0.001)
-            time.sleep(2)  # Wait for Arduino to reset
-            self.ser.flushInput()
-            self.running = True
-            print(f"Worker: Connected to {self.port} at {self.baud_rate} baud")
-            
-            # Create timer in the worker thread
-            self.timer = QtCore.QTimer()
-            self.timer.timeout.connect(self.read_data)
-            self.timer.start(10)  # Read every 10ms
-            
-        except serial.SerialException as e:
-            self.error_occurred.emit(f"Error opening serial port: {e}")
-            return
-            
-    @pyqtSlot()
-    def stop_reading(self):
-        """Stop the serial reading thread"""
-        self.running = False
-        if hasattr(self, 'timer'):
-            self.timer.stop()
-        if self.ser and self.ser.is_open:
-            self.ser.close()
-            print("Worker: Serial port closed")
-            
-    @pyqtSlot()
-    def read_data(self):
-        """Read data from serial port - called by timer in worker thread"""
-        if not self.running or not self.ser or not self.ser.is_open:
-            return
-            
-        try:
-            bytes_to_read = self.ser.in_waiting
-            if bytes_to_read > 0:
-                # Read new data and add to buffer
-                new_data = self.ser.read(bytes_to_read).decode('utf-8', errors='ignore')
-                self.line_buffer += new_data
-                
-                # Process complete lines (split on newline)
-                while '\n' in self.line_buffer:
-                    line, self.line_buffer = self.line_buffer.split('\n', 1)
-                    line = line.strip()
-                    
-                    # Skip empty lines and header lines
-                    if not line or line.startswith('Board') or line.startswith('Time'):
-                        continue
-                        
-                    if ',' in line:
-                        parts = line.split(',')
-                        if len(parts) == 4:
-                            try:
-                                timestamp = float(parts[0]) / 1000.0
-                                temp_c = float(parts[1])
-                                temp_f = float(parts[2])
-                                avg_temp_f = float(parts[3])
-                                
-                                # Validate data ranges - reject obviously bad data
-                                # Reasonable temperature range: -20°C to 100°C
-                                if not (-20 <= temp_c <= 100):
-                                    print(f"Rejected bad temp_c: {temp_c}")
-                                    continue
-                                if not (-4 <= temp_f <= 212):
-                                    print(f"Rejected bad temp_f: {temp_f}")
-                                    continue
-                                if not (-4 <= avg_temp_f <= 212):
-                                    print(f"Rejected bad avg_temp_f: {avg_temp_f}")
-                                    continue
-                                    
-                                # Check for NaN or Inf
-                                if not (np.isfinite(temp_c) and np.isfinite(temp_f) and np.isfinite(avg_temp_f)):
-                                    print(f"Rejected non-finite values")
-                                    continue
-                                
-                                # Emit data to main thread
-                                self.data_received.emit(timestamp, temp_c, temp_f, avg_temp_f)
-                                
-                            except (ValueError, IndexError) as e:
-                                print(f"Parse error on line '{line}': {e}")
-                                continue
-                
-                # Prevent buffer from growing too large (keep last 1000 chars max)
-                if len(self.line_buffer) > 1000:
-                    self.line_buffer = self.line_buffer[-1000:]
-                                
-        except Exception as e:
-            self.error_occurred.emit(f"Error reading data: {e}")
-
 class TemperatureMonitor(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -149,6 +44,11 @@ class TemperatureMonitor(QtWidgets.QWidget):
         self.temps_f = deque(maxlen=BUFFER_SIZE)
         self.avg_temps_f = deque(maxlen=BUFFER_SIZE)
         self.start_time = None
+        
+        # STFT data storage
+        self.current_sample_rate = 0.0
+        self.stft_frequencies = np.array([])
+        self.stft_power = np.array([])  # Average power across time
         
         # Setup UI
         self.setup_ui()
@@ -176,13 +76,19 @@ class TemperatureMonitor(QtWidgets.QWidget):
         pg.setConfigOption('background', 'w')
         pg.setConfigOption('foreground', 'k')
         
-        # Create plot widget for Celsius
-        self.plot_c = pg.PlotWidget(title="Object Temperature (Celsius)")
-        self.plot_c.setLabel('left', 'Temperature', units='°C')
-        self.plot_c.setLabel('bottom', 'Time', units='s')
-        self.plot_c.showGrid(x=True, y=True, alpha=0.3)
-        self.curve_c = self.plot_c.plot(pen=pg.mkPen('b', width=2), name='Temp (°C)')
-        layout.addWidget(self.plot_c)
+        # Create plot widget for Frequency Spectrum (Power vs Frequency)
+        self.plot_stft = pg.PlotWidget(title="Frequency Spectrum - Heart Rate Analysis (0-200 Hz)")
+        self.plot_stft.setLabel('bottom', 'Frequency', units='Hz')
+        self.plot_stft.setLabel('left', 'Power', units='dB')
+        self.plot_stft.showGrid(x=True, y=True, alpha=0.3)
+        # self.plot_stft.setXRange(0, 200)  # 0-200 Hz for heart rate
+        self.plot_stft.setXRange(.5, 20)
+        self.plot_stft.setYRange(-80, 20)  # Typical dB range
+        
+        # Create curve for frequency spectrum
+        self.curve_stft = self.plot_stft.plot(pen=pg.mkPen('b', width=2), name='Power Spectrum')
+        
+        layout.addWidget(self.plot_stft)
         
         # Create plot widget for Fahrenheit
         self.plot_f = pg.PlotWidget(title="Object Temperature (Fahrenheit)")
@@ -197,13 +103,10 @@ class TemperatureMonitor(QtWidgets.QWidget):
         layout.addWidget(self.plot_f)
         
         # Set initial plot ranges
-        self.plot_c.setXRange(0, WINDOW_SIZE)
-        self.plot_c.setYRange(Y_AXIS_LOW_C, Y_AXIS_HIGH_C)
         self.plot_f.setXRange(0, WINDOW_SIZE)
         self.plot_f.setYRange(Y_AXIS_LOW_F, Y_AXIS_HIGH_F)
         
         # Disable auto-ranging to use fixed window and y-axis
-        self.plot_c.disableAutoRange()
         self.plot_f.disableAutoRange()
         
     def setup_worker_thread(self):
@@ -250,10 +153,11 @@ class TemperatureMonitor(QtWidgets.QWidget):
         
         self.data_count += 1
         
-        # Print data rate every 2 seconds for debugging
+        # Print data rate every 2 seconds for debugging and update sample rate
         current_print_time = time.time()
         if current_print_time - self.last_print_time >= 2.0:
             rate = self.data_count / (current_print_time - self.last_print_time)
+            self.current_sample_rate = rate  # Store current sample rate for STFT
             print(f"Data rate: {rate:.1f} samples/sec, Buffer size: {len(self.times)}")
             self.last_print_time = current_print_time
             self.data_count = 0
@@ -290,23 +194,39 @@ class TemperatureMonitor(QtWidgets.QWidget):
         
         # Convert to numpy arrays for plotting
         t_array = np.array(self.times, dtype=np.float64)
-        c_array = np.array(self.temps_c, dtype=np.float64)
         f_array = np.array(self.temps_f, dtype=np.float64)
         avg_f_array = np.array(self.avg_temps_f, dtype=np.float64)
         
-        # Update curves - this draws ONE continuous line through all points
-        self.curve_c.setData(t_array, c_array)
+        # Update temperature curves
         self.curve_f.setData(t_array, f_array)
         self.curve_avg_f.setData(t_array, avg_f_array)
         
-        # Update X-axis range to show rolling window
+        # Compute STFT if we have enough data and a valid sample rate
+        if len(f_array) > 100 and self.current_sample_rate > 10:
+            try:
+                # Use temperature data for STFT analysis
+                frequencies, times, magnitude = compute_heart_rate_stft(
+                    f_array, self.current_sample_rate, max_freq=200
+                )
+                
+                # Compute average power across time for each frequency
+                if len(frequencies) > 0 and magnitude.shape[1] > 0:
+                    # Average the magnitude across all time windows
+                    self.stft_frequencies = frequencies
+                    self.stft_power = np.mean(magnitude, axis=1)  # Average across time dimension
+                    
+                    # Update frequency spectrum plot
+                    self.update_stft_plot()
+                    
+            except Exception as e:
+                print(f"STFT calculation error: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Update X-axis range to show rolling window for temperature plot
         x_min = max(0, current_time - WINDOW_SIZE)
         x_max = current_time + 0.5  # Add small buffer on right
-        self.plot_c.setXRange(x_min, x_max, padding=0)
         self.plot_f.setXRange(x_min, x_max, padding=0)
-        
-        # Keep Celsius Y-axis fixed to configured values
-        self.plot_c.setYRange(Y_AXIS_LOW_C, Y_AXIS_HIGH_C, padding=0)
 
         # Auto-scale Fahrenheit Y-axis with padding
         if len(f_array) > 0 and len(avg_f_array) > 0:
@@ -323,7 +243,31 @@ class TemperatureMonitor(QtWidgets.QWidget):
                     # Add 10% padding to the range
                     padding = span * 0.1
                     self.plot_f.setYRange(f_min - padding, f_max + padding, padding=0)
+    
+    def update_stft_plot(self):
+        """Update frequency spectrum plot (Power vs Frequency)"""
+        if len(self.stft_frequencies) == 0 or len(self.stft_power) == 0:
+            return
             
+        try:
+            # Plot power vs frequency
+            self.curve_stft.setData(self.stft_frequencies, self.stft_power)
+            
+            # Auto-scale Y-axis for power with some padding
+            if len(self.stft_power) > 0 and np.any(np.isfinite(self.stft_power)):
+                power_min = np.min(self.stft_power[np.isfinite(self.stft_power)])
+                power_max = np.max(self.stft_power[np.isfinite(self.stft_power)])
+                power_range = power_max - power_min
+                
+                if power_range > 1:  # Only auto-scale if we have a reasonable range
+                    padding = power_range * 0.1
+                    self.plot_stft.setYRange(power_min - padding, power_max + padding, padding=0)
+            
+        except Exception as e:
+            print(f"STFT plot update error: {e}")
+            import traceback
+            traceback.print_exc()
+             
     def closeEvent(self, event):
         """Clean up worker thread on close"""
         print("Closing application...")
