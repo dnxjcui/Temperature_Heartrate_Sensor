@@ -14,6 +14,7 @@ float B = 3950.0;
 float temp = 25.0;
 float objTempC = 0.0;
 float objTempF = 0.0;
+// float emissivity = 0.0;
 
 // **DROP-IN 1: Variables for rolling average**
 static int buffer = 100;
@@ -23,8 +24,8 @@ int sampleCount = 0;
 float avgTempF = 0.0;
 
 void setup(){
-  // Serial.begin(115200);
-  Serial.begin(500000);
+  Serial.begin(115200);
+  // Serial.begin(500000);
   Serial.println("Board initialized!");
   
   while (!Serial);
@@ -35,6 +36,7 @@ void setup(){
     Serial.println("Error connecting to MLX sensor. Check wiring.");
     while (1);
   };
+  mlx.writeEmissivity(0.98);
 
   Serial.print("Emissivity = "); Serial.println(mlx.readEmissivity());
   Serial.println("================================================");
@@ -67,6 +69,7 @@ void loop(){
 
   objTempC = mlx.readObjectTempC();
   objTempF = mlx.readObjectTempF();
+  // emissivity = mlx.readEmissivity();
   
     // **DROP-IN 2: Update rolling average**
   tempBuffer[bufferIndex] = objTempF;
@@ -94,9 +97,12 @@ void loop(){
   Serial.print(objTempF);
   Serial.print(",");
   Serial.println(avgTempF);
+  // Serial.print(",");
+  // Serial.println(emissivity);
 
   // Serial.println();
-  delayMicroseconds(10);
-  // delay(1);  
+  // delayMicroseconds(10);
+  // delayMicroseconds(100);
+  delay(1);  
 }
 
