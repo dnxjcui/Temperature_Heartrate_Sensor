@@ -31,7 +31,7 @@ SAMPLE_RATE = 200.0  # Fixed resample rate (Hz)
 LABEL = False  # Label flag (currently unused in data, baseline → NaN labels)
 WARMUP_SEC = 0.5  # Discard initial seconds each run
 
-DEBUG = True
+DEBUG = False
 # ==========================================
 
 # Serial communication settings
