@@ -5,17 +5,13 @@ import numpy as np
 import time
 from collections import deque
 import sys
+import config
 
 # Use Qt components from pyqtgraph.Qt for compatibility
 from pyqtgraph.Qt.QtCore import Signal as pyqtSignal, Slot as pyqtSlot, QObject
 from utils import SerialWorker, compute_heart_rate_stft
 
 # ============== CONFIGURATION ==============
-# Configure serial port (change COM port to match your device)
-PORT = 'COM6'  # Windows: 'COM3', Mac/Linux: '/dev/ttyUSB0' or '/dev/cu.usbserial-*'
-# BAUD_RATE = 115200
-BAUD_RATE = 500000
-
 # Time window settings
 WINDOW_SIZE = 15  # Show last N seconds of data (change this to 10 for 10-second window)
 
@@ -33,6 +29,9 @@ Y_AXIS_HIGH_F = 120 # Upper limit for Fahrenheit plot
 EXPECTED_SAMPLE_RATE = 10000  # samples per second (adjust based on your sensor)
 BUFFER_SIZE = int(WINDOW_SIZE * EXPECTED_SAMPLE_RATE * 1.1)  # 10% extra buffer
 # ==========================================
+
+PORT = config.PORT  # Serial port 
+BAUD_RATE = config.BAUD_RATE  # Baud rate
 
 class TemperatureMonitor(QtWidgets.QWidget):
     def __init__(self):
