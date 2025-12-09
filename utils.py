@@ -22,7 +22,7 @@ class SerialWorker(QObject):
     """
     Worker thread for reading serial data without blocking the UI
     """
-    data_received = pyqtSignal(float, float, float, float)  # timestamp, temp_c, temp_f, avg_temp_f
+    data_received = pyqtSignal(float, float, float, float)  # time, tmp_C, tmp_F, heart_rate
     error_occurred = pyqtSignal(str)
     
     def __init__(self, port, baud_rate):
@@ -88,30 +88,31 @@ class SerialWorker(QObject):
                         parts = line.split(',')
                         if len(parts) == 4:
                             try:
-                                timestamp = float(parts[0]) / 1000.0
-                                temp_c = float(parts[1])
-                                temp_f = float(parts[2])
-                                avg_temp_f = float(parts[3])
+                                time_val = float(parts[0]) / 1000.0  # Convert milliseconds to seconds
+                                tmp_C = float(parts[1])
+                                tmp_F = float(parts[2])
+                                heart_rate = float(parts[3])
                                 
                                 # Validate data ranges - reject obviously bad data
                                 # Reasonable temperature range: -20°C to 100°C
-                                if not (-20 <= temp_c <= 100):
-                                    print(f"Rejected bad temp_c: {temp_c}")
+                                if not (-20 <= tmp_C <= 100):
+                                    print(f"Rejected bad tmp_C: {tmp_C}")
                                     continue
-                                if not (-4 <= temp_f <= 212):
-                                    print(f"Rejected bad temp_f: {temp_f}")
+                                if not (-4 <= tmp_F <= 212):
+                                    print(f"Rejected bad tmp_F: {tmp_F}")
                                     continue
-                                if not (-4 <= avg_temp_f <= 212):
-                                    print(f"Rejected bad avg_temp_f: {avg_temp_f}")
+                                # Reasonable heart rate range: 30 to 220 bpm
+                                if not (30 <= heart_rate <= 220):
+                                    print(f"Rejected bad heart_rate: {heart_rate}")
                                     continue
                                     
                                 # Check for NaN or Inf
-                                if not (np.isfinite(temp_c) and np.isfinite(temp_f) and np.isfinite(avg_temp_f)):
+                                if not (np.isfinite(time_val) and np.isfinite(tmp_C) and np.isfinite(tmp_F) and np.isfinite(heart_rate)):
                                     print(f"Rejected non-finite values")
                                     continue
                                 
                                 # Emit data to main thread
-                                self.data_received.emit(timestamp, temp_c, temp_f, avg_temp_f)
+                                self.data_received.emit(time_val, tmp_C, tmp_F, heart_rate)
                                 
                             except (ValueError, IndexError) as e:
                                 print(f"Parse error on line '{line}': {e}")
