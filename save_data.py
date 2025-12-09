@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 Compact temperature recorder - FIXED VERSION
-- Reads variable-rate Fahrenheit data from a serial device
+- Reads variable-rate Fahrenheit data and heart rate from a serial device
 - Uses HOST-SIDE timestamps to avoid Arduino millis() overflow issues
 - Resamples to fixed rate using SciPy interpolation
-- Saves NPZ with fields: time (1xT), data_F (1xT), labels (1xT; NaN for baseline)
+- Saves NPZ with fields: time (1xT), data_F (1xT), labels (1xT; average heart rate)
 """
 
 import gc
@@ -24,12 +24,17 @@ import config
 
 # ============== CONFIGURATION ==============
 # Output settings
-OUTPUT_FOLDER = "noise_baseline_1107_20251107"  # Output folder for NPZ files
+# OUTPUT_FOLDER = "noise_baseline_1107_20251107"  # Output folder for NPZ files
+# OUTPUT_FOLDER = "test_hr_20251209"  # Output folder for NPZ files
+OUTPUT_FOLDER = "noise_baseline_20251209"  # Output folder for NPZ files
 DURATION_MINUTES = 1  # Per-sample duration (minutes)
-NUM_SAMPLES = 20  # How many samples to record
+NUM_SAMPLES = 2  # How many samples to record
 SAMPLE_RATE = 200.0  # Fixed resample rate (Hz)
-LABEL = False  # Label flag (currently unused in data, baseline → NaN labels)
+# LABEL = False  # Label flag (currently unused in data, baseline → NaN labels)
+LABEL = True  # Label flag (currently unused in data, baseline → NaN labels)
 WARMUP_SEC = 0.5  # Discard initial seconds each run
+
+OUTPUT_FOLDER += f'_DM-{DURATION_MINUTES}_NS-{NUM_SAMPLES}'
 
 DEBUG = False
 # ==========================================
@@ -51,10 +56,13 @@ def _float_or_none(x):
     except Exception:
         return None
 
-def parse_line(line: str) -> Optional[float]:
+def parse_line(line: str) -> Optional[Tuple[float, Optional[float]]]:
     """
-    Parse temperature from serial line. Returns temperature in Fahrenheit.
+    Parse temperature and heart rate from serial line.
+    Returns tuple (temperature_F, heart_rate) or None.
     Ignores timestamps from Arduino as we'll use host-side timing.
+    
+    Format: millis(),objTempC,objTempF,beatsPerMinute
     
     Try JSON → CSV → single number.
     """
@@ -69,31 +77,41 @@ def parse_line(line: str) -> Optional[float]:
         try:
             data = json.loads(s)
             temp_f = data.get('temp_f') or data.get('tempF') or data.get('fahrenheit')
+            heart_rate = data.get('heart_rate') or data.get('hr') or data.get('bpm')
             if temp_f is not None:
-                return float(temp_f)
+                return (float(temp_f), float(heart_rate) if heart_rate is not None else None)
         except:
             pass
     
-    # CSV format: millis(),objTempC,objTempF,avgTempF
+    # CSV format: millis(),objTempC,objTempF,beatsPerMinute
     if "," in s:
         parts = [p.strip() for p in s.split(",")]
         nums = [_float_or_none(p) for p in parts]
         
-        # Get temperature (prefer 3rd column = objTempF, else last non-None)
+        temp_f = None
+        heart_rate = None
+        
+        # Get temperature (3rd column = objTempF)
         if len(nums) >= 3 and nums[2] is not None:
-            return nums[2]
-        elif len(nums) >= 4 and nums[3] is not None:
-            return nums[3]  # Use avgTempF if objTempF not available
+            temp_f = nums[2]
         elif len(nums) >= 2:
-            # Get last non-None value
-            for val in reversed(nums[1:]):  # Skip timestamp
+            # Fallback: get last non-None value before heart rate
+            for val in reversed(nums[1:-1] if len(nums) >= 4 else nums[1:]):  # Skip timestamp and heart rate
                 if val is not None:
-                    return val
+                    temp_f = val
+                    break
+        
+        # Get heart rate (4th column = beatsPerMinute)
+        if len(nums) >= 4 and nums[3] is not None:
+            heart_rate = nums[3]
+        
+        if temp_f is not None:
+            return (temp_f, heart_rate)
     
-    # Single numeric
+    # Single numeric (assume temperature only)
     tf = _float_or_none(s)
     if tf is not None:
-        return tf
+        return (tf, None)
 
     return None
 
@@ -130,15 +148,17 @@ class FastSerialReader:
 
 # -------------------------- Acquisition & resampling --------------------------
 
-def acquire_block(ser, seconds: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+def acquire_block(ser, seconds: float) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[float]]:
     """
-    Collect (t, F) samples for ~seconds using HOST-SIDE timestamps.
+    Collect (t, F) samples and heart rate for ~seconds using HOST-SIDE timestamps.
     This avoids Arduino millis() overflow issues.
-    Returns two numpy arrays (t, F) with strictly increasing t.
+    Returns three values: (t, F, avg_heart_rate) with strictly increasing t.
     Timestamps start at 0 (relative to first sample).
+    avg_heart_rate is the average of all valid heart rate readings in the block.
     """
     t_buf = deque()
     f_buf = deque()
+    hr_buf = deque()  # Heart rate buffer
     
     # Use high-resolution timer for accurate timing
     t_start = time.perf_counter()
@@ -161,10 +181,12 @@ def acquire_block(ser, seconds: float) -> Tuple[Optional[np.ndarray], Optional[n
         for line in lines:
             lines_processed += 1
             
-            # Parse temperature
-            tf = parse_line(line)
-            if tf is None:
+            # Parse temperature and heart rate
+            parsed = parse_line(line)
+            if parsed is None:
                 continue
+            
+            tf, hr = parsed
             
             # Validate temperature range
             if not (-4 <= tf <= 212):
@@ -172,9 +194,14 @@ def acquire_block(ser, seconds: float) -> Tuple[Optional[np.ndarray], Optional[n
                     print(f"Rejected bad temp: {tf}°F")
                 continue
             
-            # Check for NaN or Inf
+            # Check for NaN or Inf in temperature
             if not np.isfinite(tf):
                 continue
+            
+            # Validate heart rate if present (30-220 bpm reasonable range)
+            if hr is not None:
+                if not (np.isfinite(hr) and 20 <= hr <= 255):
+                    hr = None  # Ignore invalid heart rate but keep temperature
             
             # Record HOST timestamp for this sample
             t_now = time.perf_counter()
@@ -189,6 +216,7 @@ def acquire_block(ser, seconds: float) -> Tuple[Optional[np.ndarray], Optional[n
             # Store sample
             t_buf.append(t_rel)
             f_buf.append(tf)
+            hr_buf.append(hr)  # Can be None
             sample_count += 1
         
         # Small sleep if no data to prevent CPU spinning
@@ -199,7 +227,7 @@ def acquire_block(ser, seconds: float) -> Tuple[Optional[np.ndarray], Optional[n
     
     if not t_buf:
         warnings.warn("No samples collected!")
-        return None, None
+        return None, None, None
     
     if DEBUG: 
         print(f"Collected {sample_count} samples in {actual_duration:.2f}s")
@@ -207,6 +235,13 @@ def acquire_block(ser, seconds: float) -> Tuple[Optional[np.ndarray], Optional[n
     # Convert to numpy arrays
     t_arr = np.array(t_buf, dtype=np.float64)
     f_arr = np.array(f_buf, dtype=np.float64)
+    
+    # Calculate average heart rate (only from valid readings)
+    valid_hr = [hr for hr in hr_buf if hr is not None and np.isfinite(hr)]
+    avg_heart_rate = np.mean(valid_hr) if valid_hr else None
+    
+    if DEBUG and avg_heart_rate is not None:
+        print(f"  Average heart rate: {avg_heart_rate:.1f} bpm ({len(valid_hr)}/{len(hr_buf)} valid readings)")
     
     # Verify monotonic timestamps (should always be true with host timing)
     if not np.all(np.diff(t_arr) > 0):
@@ -216,7 +251,7 @@ def acquire_block(ser, seconds: float) -> Tuple[Optional[np.ndarray], Optional[n
         t_arr = t_arr[mask]
         f_arr = f_arr[mask]
     
-    return t_arr, f_arr
+    return t_arr, f_arr, avg_heart_rate
 
 def resample_to_fixed_rate(t_arr, f_arr, fs, target_duration=None):
     """
@@ -263,6 +298,7 @@ def main():
         "PORT": PORT,
         "BAUD_RATE": BAUD_RATE,
         "TIMESTAMP_METHOD": "HOST_SIDE",
+        "LABEL_METHOD": "AVERAGE_HEART_RATE",
     }
 
     with open(os.path.join(OUTPUT_FOLDER, "config.json"), "w") as f:
@@ -292,20 +328,20 @@ def main():
             
             # Optional warmup
             if WARMUP_SEC > 0:
-                _ = acquire_block(ser, WARMUP_SEC)
+                _, _, _ = acquire_block(ser, WARMUP_SEC)
 
             # Acquire one block
             block_seconds = float(DURATION_MINUTES) * 60.0
             print(f"  Recording {block_seconds:.1f}s of data...")
             
-            t_raw, f_raw = acquire_block(ser, block_seconds)
+            t_raw, f_raw, avg_hr = acquire_block(ser, block_seconds)
             
             if t_raw is None or f_raw is None:
                 print(f"  ERROR: No data captured, retrying...")
                 retries = 0
                 while t_raw is None or f_raw is None:
                     time.sleep(0.5)  # Brief pause
-                    t_raw, f_raw = acquire_block(ser, block_seconds)
+                    t_raw, f_raw, avg_hr = acquire_block(ser, block_seconds)
                     retries += 1
                     if retries > 3:
                         print(f"  FATAL: Failed after {retries} retries")
@@ -319,8 +355,9 @@ def main():
                 print(f"  ERROR: Resampling failed; skipping.")
                 continue
 
-            # Labels: baseline → NaN
-            labels = np.full_like(f_grid, np.nan, dtype=float)
+            # Labels: use average heart rate, or NaN if not available
+            label_value = avg_hr if avg_hr is not None else np.nan
+            labels = np.full_like(f_grid, label_value, dtype=float)
 
             # File naming
             fname = (
@@ -334,10 +371,11 @@ def main():
             # Save NPZ
             np.savez_compressed(path, time=t_grid, data_F=f_grid, labels=labels)
             T = t_grid.shape[1]
-            print(f" Saved {path}, {T} samples, Temp range: {f_grid.min():.1f}°F to {f_grid.max():.1f}°F")
+            hr_str = f"{avg_hr:.1f} bpm" if avg_hr is not None else "N/A"
+            print(f" Saved {path}, {T} samples, Temp range: {f_grid.min():.1f}°F to {f_grid.max():.1f}°F, Avg HR: {hr_str}")
             
             # Cleanup
-            del t_raw, f_raw, t_grid, f_grid, labels
+            del t_raw, f_raw, t_grid, f_grid, labels, avg_hr
             gc.collect()
             
             # Brief pause between samples
