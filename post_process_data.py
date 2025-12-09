@@ -11,11 +11,12 @@ from typing import List, Tuple
 
 # ============== CONFIGURATION ==============
 # FOLDER = "noise_baseline_20251209_DM-1_NS-2"
-FOLDER = "test_hr_20251209_DM-1_NS-2"
+# FOLDER = "hr_20251209_DM-1_NS-2"
+FOLDER = "hr-2_20251209_DM-1_NS-2"
 DATA_DIR = "data"  # Base data directory
 
 # Tolerance for considering heart rates as "the same" (bpm)
-HR_TOLERANCE = 0.0001 # Consider heart rates within x bpm as the same
+HR_TOLERANCE = 0.1 # Consider heart rates within x bpm as the same
 # ==========================================
 
 def find_heart_rate_blocks(labels: np.ndarray) -> List[Tuple[int, int, float]]:
